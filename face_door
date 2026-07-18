@@ -1,0 +1,247 @@
+#include <esp_camera.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+
+// ===================== NETWORK =====================
+const char* WIFI_SSID     = "FPT Telecom 2.4G";
+const char* WIFI_PASSWORD = "12345678";
+const char* FLASK_IP      = "192.168.1.11";
+const uint16_t FLASK_PORT = 5000;
+const char* UPLOAD_PATH   = "/upload";
+
+// AI inference is heavier than simple face detection. Limit upload rate so
+// Flask always processes fresh frames instead of accumulating old requests.
+const uint32_t FRAME_INTERVAL_MS = 180;   // about 5.5 FPS
+const uint32_t CONNECT_TIMEOUT_MS = 1800;
+const uint32_t RESPONSE_TIMEOUT_MS = 2500;
+const size_t SEND_CHUNK_BYTES = 1024;
+
+// ================= AI-THINKER ESP32-CAM PINS =================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+uint32_t lastFrameAt = 0;
+uint32_t successfulFrames = 0;
+uint32_t failedFrames = 0;
+
+void connectWiFi();
+bool initCamera();
+bool sendFrameToFlask();
+bool writeAll(WiFiClient& client, const uint8_t* data, size_t length);
+int readHttpStatus(WiFiClient& client);
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n[BOOT] ESP32-CAM AI sender");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // lower latency for continuous JPEG upload
+  connectWiFi();
+
+  if (!initCamera()) {
+    Serial.println("[FATAL] Camera init failed. Restarting in 5 seconds...");
+    delay(5000);
+    ESP.restart();
+  }
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  const uint32_t now = millis();
+  if (now - lastFrameAt < FRAME_INTERVAL_MS) {
+    delay(2);
+    return;
+  }
+  lastFrameAt = now;
+
+  if (sendFrameToFlask()) {
+    successfulFrames++;
+  } else {
+    failedFrames++;
+    delay(40);
+  }
+
+  if ((successfulFrames + failedFrames) % 50 == 0) {
+    Serial.printf("[STATS] ok=%lu failed=%lu RSSI=%d dBm heap=%u\n",
+                  successfulFrames, failedFrames, WiFi.RSSI(), ESP.getFreeHeap());
+  }
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
+  WiFi.disconnect(true);
+  delay(150);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const uint32_t startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
+    delay(400);
+    Serial.print('.');
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Connected. IP=%s RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("\n[WIFI] Connection timeout");
+  }
+}
+
+bool initCamera() {
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  if (psramFound()) {
+    // VGA gives anti-spoofing more texture information than QVGA.
+    config.frame_size = FRAMESIZE_VGA;   // 640x480
+    config.jpeg_quality = 11;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;  // fallback without PSRAM
+    config.jpeg_quality = 14;
+    config.fb_count = 1;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  const esp_err_t error = esp_camera_init(&config);
+  if (error != ESP_OK) {
+    Serial.printf("[CAMERA] Init error: 0x%x\n", error);
+    return false;
+  }
+
+  sensor_t* sensor = esp_camera_sensor_get();
+  if (sensor != nullptr) {
+    sensor->set_framesize(sensor, psramFound() ? FRAMESIZE_VGA : FRAMESIZE_QVGA);
+    sensor->set_brightness(sensor, 0);
+    sensor->set_contrast(sensor, 0);
+    sensor->set_saturation(sensor, 0);
+  }
+
+  Serial.printf("[CAMERA] Ready. PSRAM=%s\n", psramFound() ? "yes" : "no");
+  return true;
+}
+
+bool sendFrameToFlask() {
+  camera_fb_t* frame = esp_camera_fb_get();
+  if (frame == nullptr) {
+    Serial.println("[CAMERA] Capture failed");
+    return false;
+  }
+
+  WiFiClient client;
+  client.setTimeout(RESPONSE_TIMEOUT_MS);
+
+  if (!client.connect(FLASK_IP, FLASK_PORT, CONNECT_TIMEOUT_MS)) {
+    Serial.println("[HTTP] Cannot connect to Flask");
+    esp_camera_fb_return(frame);
+    return false;
+  }
+
+  client.printf("POST %s HTTP/1.1\r\n", UPLOAD_PATH);
+  client.printf("Host: %s:%u\r\n", FLASK_IP, FLASK_PORT);
+  client.println("Content-Type: image/jpeg");
+  client.printf("Content-Length: %u\r\n", frame->len);
+  client.println("Connection: close");
+  client.println("X-Camera-Id: esp32cam-front-door");
+  client.println();
+
+  const bool sent = writeAll(client, frame->buf, frame->len);
+  esp_camera_fb_return(frame);  // release PSRAM immediately after upload
+
+  if (!sent) {
+    Serial.println("[HTTP] JPEG upload interrupted");
+    client.stop();
+    return false;
+  }
+
+  const int statusCode = readHttpStatus(client);
+  client.stop();
+
+  if (statusCode != 200) {
+    Serial.printf("[HTTP] Flask returned %d\n", statusCode);
+    return false;
+  }
+  return true;
+}
+
+bool writeAll(WiFiClient& client, const uint8_t* data, size_t length) {
+  size_t sent = 0;
+  while (sent < length) {
+    if (!client.connected()) return false;
+
+    const size_t remaining = length - sent;
+    const size_t chunk = remaining < SEND_CHUNK_BYTES ? remaining : SEND_CHUNK_BYTES;
+    const size_t written = client.write(data + sent, chunk);
+    if (written == 0) {
+      delay(2);
+      continue;
+    }
+    sent += written;
+    delay(0); // feed watchdog
+  }
+  return true;
+}
+
+int readHttpStatus(WiFiClient& client) {
+  const uint32_t startedAt = millis();
+  while (!client.available() && client.connected() &&
+         millis() - startedAt < RESPONSE_TIMEOUT_MS) {
+    delay(2);
+  }
+
+  if (!client.available()) return -1;
+
+  const String statusLine = client.readStringUntil('\n');
+  int statusCode = -1;
+  if (sscanf(statusLine.c_str(), "HTTP/%*s %d", &statusCode) != 1) {
+    return -1;
+  }
+
+  // Drain the small response so the TCP connection closes cleanly.
+  while (client.connected() && millis() - startedAt < RESPONSE_TIMEOUT_MS) {
+    while (client.available()) client.read();
+    delay(1);
+  }
+  return statusCode;
+}
