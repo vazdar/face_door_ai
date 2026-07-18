@@ -1,0 +1,189 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+// ===================== NETWORK =====================
+const char* WIFI_SSID     = "FPT Telecom 2.4G";
+const char* WIFI_PASSWORD = "12345678";
+
+// ====================== SERVO ======================
+constexpr uint8_t SERVO_PIN = 13;
+constexpr int CLOSED_ANGLE = 0;
+constexpr int OPEN_ANGLE = 90;
+constexpr uint32_t OPEN_DURATION_MS = 5000;
+constexpr uint32_t MIN_REOPEN_INTERVAL_MS = 1200;
+
+WebServer server(80);
+Servo doorServo;
+
+bool doorOpen = false;
+uint32_t openedAt = 0;
+uint32_t lastCommandAt = 0;
+
+void connectWiFi();
+void setDoor(bool openDoor, const char* reason);
+void handleRoot();
+void handleOpen();
+void handleClose();
+void handleStatus();
+void sendJson(int statusCode, const String& body);
+
+void setup() {
+  Serial.begin(115200);
+  delay(250);
+  Serial.println("\n[BOOT] ESP32 servo door controller");
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  doorServo.setPeriodHertz(50);
+  doorServo.attach(SERVO_PIN, 500, 2400);
+  setDoor(false, "startup");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  connectWiFi();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/open", HTTP_GET, handleOpen);       // compatible with Flask
+  server.on("/close", HTTP_GET, handleClose);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.onNotFound([]() {
+    sendJson(404, "{\"ok\":false,\"error\":\"not_found\"}");
+  });
+
+  server.begin();
+  Serial.println("[HTTP] Server started on port 80");
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  server.handleClient();
+
+  // Non-blocking automatic close. The web server remains responsive.
+  if (doorOpen && millis() - openedAt >= OPEN_DURATION_MS) {
+    setDoor(false, "auto_timeout");
+  }
+
+  delay(2);
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
+  WiFi.disconnect(true);
+  delay(150);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const uint32_t startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
+    delay(400);
+    Serial.print('.');
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Connected. IP=%s RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("\n[WIFI] Connection timeout");
+  }
+}
+
+void setDoor(bool openDoor, const char* reason) {
+  doorServo.write(openDoor ? OPEN_ANGLE : CLOSED_ANGLE);
+  doorOpen = openDoor;
+  lastCommandAt = millis();
+  if (openDoor) openedAt = millis();
+
+  Serial.printf("[DOOR] state=%s reason=%s\n",
+                doorOpen ? "OPEN" : "CLOSED", reason);
+}
+
+void handleOpen() {
+  // Idempotent: repeated AI requests while already open do not restart the
+  // five-second timer, so a person standing still cannot keep the door open.
+  if (doorOpen) {
+    sendJson(200, "{\"ok\":true,\"state\":\"OPEN\",\"reason\":\"already_open\"}");
+    return;
+  }
+
+  if (millis() - lastCommandAt < MIN_REOPEN_INTERVAL_MS) {
+    sendJson(429, "{\"ok\":false,\"state\":\"CLOSED\",\"reason\":\"cooldown\"}");
+    return;
+  }
+
+  setDoor(true, "ai_authorized");
+  sendJson(200, "{\"ok\":true,\"state\":\"OPEN\",\"reason\":\"opened\"}");
+}
+
+void handleClose() {
+  if (!doorOpen) {
+    sendJson(200, "{\"ok\":true,\"state\":\"CLOSED\",\"reason\":\"already_closed\"}");
+    return;
+  }
+
+  setDoor(false, "manual_close");
+  sendJson(200, "{\"ok\":true,\"state\":\"CLOSED\",\"reason\":\"closed\"}");
+}
+
+void handleStatus() {
+  const uint32_t remaining = doorOpen
+      ? (OPEN_DURATION_MS > millis() - openedAt
+            ? OPEN_DURATION_MS - (millis() - openedAt)
+            : 0)
+      : 0;
+
+  String json = "{\"ok\":true,\"state\":\"";
+  json += doorOpen ? "OPEN" : "CLOSED";
+  json += "\",\"remaining_ms\":";
+  json += remaining;
+  json += ",\"ip\":\"";
+  json += WiFi.localIP().toString();
+  json += "\"}";
+  sendJson(200, json);
+}
+
+void handleRoot() {
+  const char html[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Face Door Controller</title>
+  <style>
+    body{font-family:Arial,sans-serif;text-align:center;background:#111827;color:#f9fafb;padding:35px}
+    .card{max-width:440px;margin:auto;background:#1f2937;padding:24px;border-radius:16px}
+    button{font-size:18px;padding:14px 28px;margin:8px;border:0;border-radius:10px;color:white;cursor:pointer}
+    .open{background:#16a34a}.close{background:#dc2626}
+    #state{font-size:24px;font-weight:bold;margin:18px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Face Door</h1>
+    <div id="state">Đang tải...</div>
+    <button class="open" onclick="command('/open')">OPEN</button>
+    <button class="close" onclick="command('/close')">CLOSE</button>
+  </div>
+<script>
+async function refresh(){
+  try{const r=await fetch('/status');const d=await r.json();
+      document.getElementById('state').textContent='Cửa: '+d.state;}
+  catch(e){document.getElementById('state').textContent='Mất kết nối';}
+}
+async function command(path){await fetch(path);refresh();}
+setInterval(refresh,1000);refresh();
+</script>
+</body>
+</html>)HTML";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void sendJson(int statusCode, const String& body) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(statusCode, "application/json", body);
+}
